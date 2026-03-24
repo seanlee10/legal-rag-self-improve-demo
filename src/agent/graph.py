@@ -1,0 +1,292 @@
+"""LangGraph RAG agent with OpenSearch retriever and GPT-4o-mini.
+
+Retrieves relevant documents from OpenSearch, then generates a response
+using GPT-4o-mini with the retrieved context.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+import aiohttp
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.retrievers import BaseRetriever
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph
+from langgraph.runtime import Runtime
+from agent.instrumentation import tracer_provider
+from openinference.instrumentation.langchain import LangChainInstrumentor, get_current_span
+from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
+from opentelemetry import trace
+from opensearchpy import AsyncOpenSearch
+from pydantic import Field
+from typing_extensions import TypedDict
+
+tracer = tracer_provider.get_tracer(__name__)
+
+# --- RAG prompt ---
+RAG_TEMPLATE = """
+You are an AI assistant tasked with answering questions based on provided context. Your goal is to provide accurate and relevant answers using only the information given.
+
+Here is the context you should use to answer the question:
+
+<context>
+{context}
+</context>
+
+Now, here is the question you need to answer:
+
+<question>
+{query}
+</question>
+
+Instructions:
+1. Carefully read and analyze the provided context.
+2. Identify key information in the context that is relevant to the question.
+3. Formulate an answer to the question using only the information from the given context.
+4. If the context does not contain enough information to fully answer the question, state this clearly in your response.
+5. Do not use any external knowledge or information not present in the provided context.
+6. Keep your answer concise and to the point, while ensuring it fully addresses the question.
+
+Format your response as follows:
+1. Begin with a brief answer to the question.
+2. Follow with a more detailed explanation, if necessary.
+3. If you're quoting directly from the context, use quotation marks and indicate the quote's location in the context.
+
+Remember, it's important to rely solely on the given context and not to introduce any external information or assumptions in your answer.
+"""
+
+rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
+
+
+# --- Async embedding helper ---
+async def generate_embedding(input_text: str) -> List[float]:
+    """Generate an embedding vector via OpenAI text-embedding-3-large."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": f'Bearer {os.environ["OPENAI_API_KEY"]}',
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "text-embedding-3-large",
+                "input": input_text,
+                "dimensions": 1024,
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            data = await resp.json()
+            return data["data"][0]["embedding"]
+
+
+# --- Embedding span for drift monitoring ---
+EMBEDDING_MODEL = "text-embedding-3-large"
+
+
+def log_embedding_span(
+    docs: List[Document],
+    model_name: str = EMBEDDING_MODEL,
+    parent_span: Any = None,
+) -> None:
+    """Log a dedicated EMBEDDING span with vectors and text for Arize drift monitoring."""
+    chunks = [
+        {
+            "text": doc.page_content,
+            "vector": doc.metadata.get("embedding", []),
+            "source": doc.metadata.get("source", "unknown"),
+        }
+        for doc in docs
+        if doc.metadata.get("embedding")
+    ]
+    if not chunks:
+        return
+
+    # Build context from the parent span (retriever span)
+    ctx = trace.set_span_in_context(parent_span) if parent_span else None
+
+    with tracer.start_as_current_span(
+        "document_chunk_embeddings", context=ctx
+    ) as span:
+        span.set_attribute(
+            SpanAttributes.OPENINFERENCE_SPAN_KIND,
+            OpenInferenceSpanKindValues.EMBEDDING.value,
+        )
+        span.set_attribute(SpanAttributes.EMBEDDING_MODEL_NAME, model_name)
+        span.set_attribute(
+            SpanAttributes.EMBEDDING_INVOCATION_PARAMETERS,
+            json.dumps({"model": model_name, "dimension": len(chunks[0]["vector"])}),
+        )
+        span.set_attribute(SpanAttributes.INPUT_VALUE, json.dumps({"chunk_count": len(chunks)}))
+        span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "application/json")
+
+        for i, chunk in enumerate(chunks):
+            span.set_attribute(f"embedding.embeddings.{i}.embedding.text", chunk["text"])
+            span.set_attribute(f"embedding.embeddings.{i}.embedding.vector", chunk["vector"])
+
+        span.set_attribute(
+            SpanAttributes.METADATA,
+            json.dumps({"sources": [c["source"] for c in chunks]}),
+        )
+        span.set_attribute(SpanAttributes.OUTPUT_VALUE, f"{len(chunks)} embeddings logged")
+
+
+# --- Async OpenSearch retriever ---
+class OpenSearchRetriever(BaseRetriever):
+    """Retrieve documents from OpenSearch using hybrid text + kNN search."""
+
+    k: int = 10
+    client: Any = Field(description="AsyncOpenSearch client")
+    index: str = Field(description="Index name to search")
+
+    async def _aget_relevant_documents(  # type: ignore[override]
+        self, query: str, *, run_manager: Any = None,
+    ) -> List[Document]:
+        """Search OpenSearch with async hybrid text and vector query."""
+        embedding = await generate_embedding(query)
+        response = await self.client.search(
+            index=self.index,
+            body={
+                "size": self.k,
+                "query": {
+                    "bool": {
+                        "should": [
+                            {
+                                "function_score": {
+                                    "query": {
+                                        "multi_match": {
+                                            "query": query,
+                                            "fields": ["chunk"],
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "function_score": {
+                                    "query": {
+                                        "knn": {
+                                            "embedding": {
+                                                "vector": embedding,
+                                                "k": self.k * 2,
+                                            }
+                                        }
+                                    },
+                                    "script_score": {
+                                        "script": {
+                                            "source": "if (_score >= params.min_score) { return _score; } else { return 0; }",
+                                            "params": {"min_score": 0.4},
+                                        }
+                                    },
+                                    "boost_mode": "replace",
+                                }
+                            },
+                        ]
+                    }
+                },
+            },
+        )
+
+        docs = []
+        for hit in response["hits"]["hits"]:
+            source = hit["_source"]
+            metadata = {**source["metadata"], "score": hit["_score"]}
+            if "embedding" in source:
+                metadata["embedding"] = source["embedding"]
+            doc = Document(
+                page_content=source["chunk"],
+                metadata=metadata,
+            )
+            docs.append(doc)
+
+        # Find the retriever span (child of the node span)
+        retriever_span = None
+        node_span = get_current_span()
+        if node_span:
+            node_span_id = node_span.get_span_context().span_id
+            instrumentor = LangChainInstrumentor()
+            tracer_obj = getattr(instrumentor, "_tracer", None)
+            if tracer_obj:
+                spans = getattr(tracer_obj, "_spans_by_run", {})
+                for _, s in spans.items():
+                    parent = getattr(s, "parent", None)
+                    if parent and parent.span_id == node_span_id:
+                        retriever_span = s
+                        break
+        log_embedding_span(docs, parent_span=retriever_span or node_span)
+
+        return docs
+
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        """Not used — async version is preferred."""
+        raise NotImplementedError("Use ainvoke() instead")
+
+
+# --- Clients ---
+opensearch_client = AsyncOpenSearch(
+    hosts=[{"host": os.environ["HOST"], "port": 443}],
+    http_auth=(os.environ["USERNAME"], os.environ["PASSWORD"]),
+    use_ssl=True,
+    verify_certs=True,
+)
+retriever = OpenSearchRetriever(client=opensearch_client, index=os.environ["INDEX"])
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+
+# --- Graph state & config ---
+class Context(TypedDict):
+    """Context parameters for the agent."""
+
+    my_configurable_param: str
+
+
+@dataclass
+class State:
+    """Input state for the agent."""
+
+    messages: List[AnyMessage] = field(default_factory=list)
+    docs: List[Document] = field(default_factory=list)
+
+
+def _extract_query(message: Any) -> str:
+    """Extract text content from a message (handles both objects and dicts)."""
+    if hasattr(message, "content"):
+        return message.content
+    if isinstance(message, dict):
+        return message.get("content", str(message))
+    return str(message)
+
+
+# --- Graph nodes ---
+async def retrieve(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+    """Retrieve relevant documents from OpenSearch."""
+    query = _extract_query(state.messages[-1])
+    docs = await retriever.ainvoke(query)
+    return {"docs": docs}
+
+
+async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+    """Generate a response using retrieved context and GPT-4o-mini."""
+    query = _extract_query(state.messages[-1])
+
+    context = "\n\n".join(doc.page_content for doc in state.docs)
+    chain = rag_prompt | llm | StrOutputParser()
+    response = await chain.ainvoke({"query": query, "context": context})
+
+    return {"messages": [AIMessage(content=response)]}
+
+
+# --- Define the graph ---
+graph = (
+    StateGraph(State, context_schema=Context)
+    .add_node(retrieve)
+    .add_node(call_model)
+    .add_edge("__start__", "retrieve")
+    .add_edge("retrieve", "call_model")
+    .compile(name="New Graph")
+)
