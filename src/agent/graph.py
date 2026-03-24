@@ -6,6 +6,7 @@ using GPT-4o-mini with the retrieved context.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -137,6 +138,49 @@ def log_embedding_span(
         span.set_attribute(SpanAttributes.OUTPUT_VALUE, f"{len(chunks)} embeddings logged")
 
 
+def _rrf_merge(
+    bm25_resp: Dict[str, Any],
+    knn_resp: Dict[str, Any],
+    k: int,
+    rrf_k: int = 60,
+) -> List[Document]:
+    """Merge two OpenSearch responses using Reciprocal Rank Fusion, with dedup."""
+    scores: Dict[str, float] = {}
+    hit_map: Dict[str, Dict[str, Any]] = {}
+
+    for rank, hit in enumerate(bm25_resp["hits"]["hits"]):
+        doc_id = hit["_id"]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+        hit_map.setdefault(doc_id, hit)
+
+    for rank, hit in enumerate(knn_resp["hits"]["hits"]):
+        doc_id = hit["_id"]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+        hit_map.setdefault(doc_id, hit)
+
+    ranked_ids = sorted(scores, key=lambda d: scores[d], reverse=True)
+
+    docs: List[Document] = []
+    seen_sources: set[str] = set()
+    for doc_id in ranked_ids:
+        if len(docs) >= k:
+            break
+        hit = hit_map[doc_id]
+        source_data = hit["_source"]
+        source_id = source_data.get("metadata", {}).get("source", doc_id)
+        if source_id in seen_sources:
+            continue
+        seen_sources.add(source_id)
+        metadata = {**source_data.get("metadata", {}), "score": scores[doc_id]}
+        if "embedding" in source_data:
+            metadata["embedding"] = source_data["embedding"]
+        docs.append(
+            Document(page_content=source_data["chunk"], metadata=metadata)
+        )
+
+    return docs
+
+
 # --- Async OpenSearch retriever ---
 class OpenSearchRetriever(BaseRetriever):
     """Retrieve documents from OpenSearch using hybrid text + kNN search."""
@@ -148,61 +192,37 @@ class OpenSearchRetriever(BaseRetriever):
     async def _aget_relevant_documents(  # type: ignore[override]
         self, query: str, *, run_manager: Any = None,
     ) -> List[Document]:
-        """Search OpenSearch with async hybrid text and vector query."""
+        """Search OpenSearch with separate BM25 and kNN queries fused via RRF."""
+        fetch_size = self.k * 3
         embedding = await generate_embedding(query)
-        response = await self.client.search(
-            index=self.index,
-            body={
-                "size": self.k,
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "function_score": {
-                                    "query": {
-                                        "multi_match": {
-                                            "query": query,
-                                            "fields": ["chunk"],
-                                        }
-                                    }
-                                }
-                            },
-                            {
-                                "function_score": {
-                                    "query": {
-                                        "knn": {
-                                            "embedding": {
-                                                "vector": embedding,
-                                                "k": self.k * 2,
-                                            }
-                                        }
-                                    },
-                                    "script_score": {
-                                        "script": {
-                                            "source": "if (_score >= params.min_score) { return _score; } else { return 0; }",
-                                            "params": {"min_score": 0.4},
-                                        }
-                                    },
-                                    "boost_mode": "replace",
-                                }
-                            },
-                        ]
-                    }
-                },
+
+        bm25_query = {
+            "size": fetch_size,
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["chunk", "metadata.title^2"],
+                }
             },
+        }
+        knn_query = {
+            "size": fetch_size,
+            "query": {
+                "knn": {
+                    "embedding": {
+                        "vector": embedding,
+                        "k": fetch_size,
+                    }
+                }
+            },
+        }
+
+        bm25_resp, knn_resp = await asyncio.gather(
+            self.client.search(index=self.index, body=bm25_query),
+            self.client.search(index=self.index, body=knn_query),
         )
 
-        docs = []
-        for hit in response["hits"]["hits"]:
-            source = hit["_source"]
-            metadata = {**source["metadata"], "score": hit["_score"]}
-            if "embedding" in source:
-                metadata["embedding"] = source["embedding"]
-            doc = Document(
-                page_content=source["chunk"],
-                metadata=metadata,
-            )
-            docs.append(doc)
+        docs = _rrf_merge(bm25_resp, knn_resp, k=self.k)
 
         # Find the retriever span (child of the node span)
         retriever_span = None
