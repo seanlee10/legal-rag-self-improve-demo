@@ -65,6 +65,17 @@ Remember, it's important to rely solely on the given context and not to introduc
 
 rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
 
+# --- Query expansion prompt ---
+QUERY_EXPANSION_TEMPLATE = """Extract the key legal concepts, terms, and topics from this question. \
+Output a short search query (max 30 words) using precise legal terminology that would match \
+a relevant passage in a legal bench book. Do not answer the question — only output search terms.
+
+Question: {query}
+
+Search query:"""
+
+query_expansion_prompt = ChatPromptTemplate.from_template(QUERY_EXPANSION_TEMPLATE)
+
 
 # --- Async embedding helper ---
 async def generate_embedding(input_text: str) -> List[float]:
@@ -190,17 +201,22 @@ class OpenSearchRetriever(BaseRetriever):
     index: str = Field(description="Index name to search")
 
     async def _aget_relevant_documents(  # type: ignore[override]
-        self, query: str, *, run_manager: Any = None,
+        self,
+        query: str,
+        *,
+        run_manager: Any = None,
+        search_query: str = "",
     ) -> List[Document]:
         """Search OpenSearch with separate BM25 and kNN queries fused via RRF."""
         fetch_size = self.k * 3
+        bm25_text = search_query or query
         embedding = await generate_embedding(query)
 
         bm25_query = {
             "size": fetch_size,
             "query": {
                 "multi_match": {
-                    "query": query,
+                    "query": bm25_text,
                     "fields": ["chunk", "metadata.title^2"],
                 }
             },
@@ -271,6 +287,7 @@ class State:
 
     messages: List[AnyMessage] = field(default_factory=list)
     docs: List[Document] = field(default_factory=list)
+    search_query: str = ""
 
 
 def _extract_query(message: Any) -> str:
@@ -283,10 +300,18 @@ def _extract_query(message: Any) -> str:
 
 
 # --- Graph nodes ---
+async def rewrite_query(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+    """Expand the user question into search-optimized legal terms."""
+    query = _extract_query(state.messages[-1])
+    chain = query_expansion_prompt | llm | StrOutputParser()
+    search_query = await chain.ainvoke({"query": query})
+    return {"search_query": search_query.strip()}
+
+
 async def retrieve(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     """Retrieve relevant documents from OpenSearch."""
     query = _extract_query(state.messages[-1])
-    docs = await retriever.ainvoke(query)
+    docs = await retriever.ainvoke(query, search_query=state.search_query)
     return {"docs": docs}
 
 
@@ -304,9 +329,11 @@ async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
 # --- Define the graph ---
 graph = (
     StateGraph(State, context_schema=Context)
+    .add_node(rewrite_query)
     .add_node(retrieve)
     .add_node(call_model)
-    .add_edge("__start__", "retrieve")
+    .add_edge("__start__", "rewrite_query")
+    .add_edge("rewrite_query", "retrieve")
     .add_edge("retrieve", "call_model")
     .compile(name="New Graph")
 )
