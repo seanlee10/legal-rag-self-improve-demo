@@ -315,6 +315,35 @@ async def retrieve(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     return {"docs": docs}
 
 
+async def rerank(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+    """Rerank retrieved documents using Cohere rerank API."""
+    if not state.docs:
+        return {"docs": []}
+    query = _extract_query(state.messages[-1])
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.cohere.com/v2/rerank",
+            headers={
+                "Authorization": f'Bearer {os.environ["COHERE_API_KEY"]}',
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "rerank-v3.5",
+                "query": query,
+                "documents": [doc.page_content for doc in state.docs],
+                "top_n": len(state.docs),
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            data = await resp.json()
+    reranked = []
+    for result in data["results"]:
+        doc = state.docs[result["index"]]
+        doc.metadata["rerank_score"] = result["relevance_score"]
+        reranked.append(doc)
+    return {"docs": reranked}
+
+
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     """Generate a response using retrieved context and GPT-4o-mini."""
     query = _extract_query(state.messages[-1])
@@ -331,9 +360,11 @@ graph = (
     StateGraph(State, context_schema=Context)
     .add_node(rewrite_query)
     .add_node(retrieve)
+    .add_node(rerank)
     .add_node(call_model)
     .add_edge("__start__", "rewrite_query")
     .add_edge("rewrite_query", "retrieve")
-    .add_edge("retrieve", "call_model")
+    .add_edge("retrieve", "rerank")
+    .add_edge("rerank", "call_model")
     .compile(name="New Graph")
 )

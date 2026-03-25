@@ -12,7 +12,8 @@ The graph runs three nodes in sequence:
 
 1. **rewrite_query** — Extracts concise legal search terms from the user's question using GPT-4o-mini
 2. **retrieve** — Hybrid search (BM25 + kNN) against OpenSearch, merged with Reciprocal Rank Fusion (RRF) and deduplicated by source
-3. **call_model** — Generates an answer grounded in the retrieved passages using GPT-4o-mini
+3. **rerank** — Reranks retrieved documents using Cohere rerank-v3.5 to push the most relevant passage to the top
+4. **call_model** — Generates an answer grounded in the retrieved passages using GPT-4o-mini
 
 Core logic is in [`src/agent/graph.py`](./src/agent/graph.py).
 
@@ -23,6 +24,7 @@ Core logic is in [`src/agent/graph.py`](./src/agent/graph.py).
 - Python 3.10+
 - An OpenSearch instance with the bench book indexed
 - An OpenAI API key
+- A Cohere API key (for reranking)
 
 ### Install
 
@@ -38,6 +40,7 @@ Create a `.env` file with the required credentials:
 
 ```text
 OPENAI_API_KEY=sk-...
+COHERE_API_KEY=your-cohere-api-key
 HOST=your-opensearch-host
 USERNAME=your-username
 PASSWORD=your-password
