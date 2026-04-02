@@ -318,7 +318,7 @@ def parse_input(state: State) -> Dict[str, Any]:
     text_parts: List[str] = []
     for part in content:
         text = part.get("text", "") if isinstance(part, dict) else str(part)
-        if text.lower().endswith(".pdf"):
+        if not source_file and text.lower().endswith(".pdf"):
             source_file = text
         else:
             text_parts.append(text)
