@@ -280,7 +280,7 @@ class OpenSearchRetriever(BaseRetriever):
 
         return docs
 
-    def _get_relevant_documents(self, query: str) -> List[Document]:
+    def _get_relevant_documents(self, query: str, **kwargs: Any) -> List[Document]:
         """Not used — async version is preferred."""
         raise NotImplementedError("Use ainvoke() instead")
 
@@ -326,7 +326,12 @@ def _extract_query(message: Any) -> str:
 def parse_input(state: State) -> Dict[str, Any]:
     """Extract question text and optional filename from a multipart message."""
     message = state.messages[-1]
-    content = message.content
+    if hasattr(message, "content"):
+        content = message.content
+    elif isinstance(message, dict):
+        content = message.get("content", str(message))
+    else:
+        content = str(message)
 
     # Plain text message — no file attached
     if isinstance(content, str):
