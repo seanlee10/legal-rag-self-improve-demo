@@ -76,6 +76,37 @@ Search query:"""
 
 query_expansion_prompt = ChatPromptTemplate.from_template(QUERY_EXPANSION_TEMPLATE)
 
+# --- Summarization prompt ---
+SUMMARIZE_SYSTEM_TEMPLATE = """You are an expert at summarizing regulatory and financial documents.
+Produce a structured summary of the following document. Your summary must cover:
+
+1. **Purpose and Scope**: What is this circular/document about and who does it apply to?
+2. **Key Provisions**: What are the main requirements, rules, or guidelines introduced?
+3. **Compliance Obligations**: What must regulated entities do, and by when?
+4. **Penalties or Consequences**: What happens if requirements are not met? (If not mentioned, state so.)
+
+Rules:
+- Use ONLY information from the provided document. Do not add external knowledge.
+- Preserve specific regulatory references: section numbers, dates, monetary thresholds, and named entities.
+- Be concise but complete — do not omit material provisions.
+- Use bullet points for lists of requirements or obligations."""
+
+SUMMARIZE_DOCUMENT_TEMPLATE = """<document>
+{document}
+</document>
+
+Provide a structured summary of this document following the format specified."""
+
+SUMMARIZE_SECTIONS_TEMPLATE = """<section_summaries>
+{section_summaries}
+</section_summaries>
+
+Synthesize the above section summaries into a single cohesive document summary.
+Follow the same structure: Purpose and Scope, Key Provisions, Compliance Obligations, Penalties or Consequences.
+Remove redundancy across sections while preserving all unique information."""
+
+SUMMARIZE_TOKEN_THRESHOLD = 10000
+
 
 # --- Async embedding helper ---
 async def generate_embedding(input_text: str) -> List[float]:
@@ -305,6 +336,7 @@ opensearch_client = AsyncOpenSearch(
 )
 retriever = OpenSearchRetriever(client=opensearch_client, index=os.environ["INDEX"])
 llm = ChatOpenAI(model="gpt-4o-mini")
+llm_summarize = ChatOpenAI(model="gpt-4o")
 
 
 # --- Graph state & config ---
@@ -345,6 +377,32 @@ def _detect_intent(text: str) -> str:
         if kw in lower:
             return "summarize"
     return "qa"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count as roughly 1 token per 4 characters."""
+    return len(text) // 4
+
+
+def _chunk_documents(
+    docs: List[Document], max_tokens: int = SUMMARIZE_TOKEN_THRESHOLD
+) -> List[List[Document]]:
+    """Split documents into groups that fit within a token budget."""
+    groups: List[List[Document]] = []
+    current_group: List[Document] = []
+    current_tokens = 0
+    for doc in docs:
+        doc_tokens = _estimate_tokens(doc.page_content)
+        if current_group and current_tokens + doc_tokens > max_tokens:
+            groups.append(current_group)
+            current_group = [doc]
+            current_tokens = doc_tokens
+        else:
+            current_group.append(doc)
+            current_tokens += doc_tokens
+    if current_group:
+        groups.append(current_group)
+    return groups
 
 
 # --- Graph nodes ---
@@ -427,6 +485,50 @@ async def retrieve_full_document(
         for hit in resp["hits"]["hits"]
     ]
     return {"docs": docs}
+
+
+async def summarize_document(
+    state: State, runtime: Runtime[Context]
+) -> Dict[str, Any]:
+    """Summarize a full document, using two-stage strategy for long documents."""
+    full_text = "\n\n".join(doc.page_content for doc in state.docs)
+    total_tokens = _estimate_tokens(full_text)
+
+    if total_tokens <= SUMMARIZE_TOKEN_THRESHOLD:
+        # Single-pass summarization
+        messages = [
+            ("system", SUMMARIZE_SYSTEM_TEMPLATE),
+            ("human", SUMMARIZE_DOCUMENT_TEMPLATE),
+        ]
+        prompt = ChatPromptTemplate.from_messages(messages)
+        chain = prompt | llm_summarize | StrOutputParser()
+        summary = await chain.ainvoke({"document": full_text})
+    else:
+        # Two-stage: section summaries then synthesis
+        groups = _chunk_documents(state.docs)
+        section_prompt = ChatPromptTemplate.from_messages([
+            ("system", SUMMARIZE_SYSTEM_TEMPLATE),
+            ("human", SUMMARIZE_DOCUMENT_TEMPLATE),
+        ])
+        section_chain = section_prompt | llm_summarize | StrOutputParser()
+
+        section_summaries = await asyncio.gather(*[
+            section_chain.ainvoke({
+                "document": "\n\n".join(doc.page_content for doc in group)
+            })
+            for group in groups
+        ])
+
+        synthesis_prompt = ChatPromptTemplate.from_messages([
+            ("system", SUMMARIZE_SYSTEM_TEMPLATE),
+            ("human", SUMMARIZE_SECTIONS_TEMPLATE),
+        ])
+        synthesis_chain = synthesis_prompt | llm_summarize | StrOutputParser()
+        summary = await synthesis_chain.ainvoke({
+            "section_summaries": "\n\n---\n\n".join(section_summaries)
+        })
+
+    return {"messages": [AIMessage(content=summary)]}
 
 
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
