@@ -1,7 +1,7 @@
-"""LangGraph RAG agent with OpenSearch retriever and GPT-4o-mini.
+"""LangGraph RAG agent with OpenSearch retriever, GPT-4o-mini QA, and GPT-4o summarization.
 
-Retrieves relevant documents from OpenSearch, then generates a response
-using GPT-4o-mini with the retrieved context.
+Retrieves relevant documents from OpenSearch for question answering,
+or retrieves full documents for summarization with live Arize evaluation.
 """
 
 from __future__ import annotations
@@ -119,7 +119,7 @@ async def generate_embedding(input_text: str) -> List[float]:
         async with session.post(
             "https://api.openai.com/v1/embeddings",
             headers={
-                "Authorization": f'Bearer {os.environ["OPENAI_API_KEY"]}',
+                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
                 "Content-Type": "application/json",
             },
             json={
@@ -160,9 +160,7 @@ def log_embedding_span(
     # Build context from the parent span (retriever span)
     ctx = trace.set_span_in_context(parent_span) if parent_span else None
 
-    with tracer.start_as_current_span(
-        "document_chunk_embeddings", context=ctx
-    ) as span:
+    with tracer.start_as_current_span("document_chunk_embeddings", context=ctx) as span:
         span.set_attribute(
             SpanAttributes.OPENINFERENCE_SPAN_KIND,
             OpenInferenceSpanKindValues.EMBEDDING.value,
@@ -172,18 +170,26 @@ def log_embedding_span(
             SpanAttributes.EMBEDDING_INVOCATION_PARAMETERS,
             json.dumps({"model": model_name, "dimension": len(chunks[0]["vector"])}),
         )
-        span.set_attribute(SpanAttributes.INPUT_VALUE, json.dumps({"chunk_count": len(chunks)}))
+        span.set_attribute(
+            SpanAttributes.INPUT_VALUE, json.dumps({"chunk_count": len(chunks)})
+        )
         span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "application/json")
 
         for i, chunk in enumerate(chunks):
-            span.set_attribute(f"embedding.embeddings.{i}.embedding.text", chunk["text"])
-            span.set_attribute(f"embedding.embeddings.{i}.embedding.vector", chunk["vector"])
+            span.set_attribute(
+                f"embedding.embeddings.{i}.embedding.text", chunk["text"]
+            )
+            span.set_attribute(
+                f"embedding.embeddings.{i}.embedding.vector", chunk["vector"]
+            )
 
         span.set_attribute(
             SpanAttributes.METADATA,
             json.dumps({"sources": [c["source"] for c in chunks]}),
         )
-        span.set_attribute(SpanAttributes.OUTPUT_VALUE, f"{len(chunks)} embeddings logged")
+        span.set_attribute(
+            SpanAttributes.OUTPUT_VALUE, f"{len(chunks)} embeddings logged"
+        )
 
 
 def _rrf_merge(
@@ -222,9 +228,7 @@ def _rrf_merge(
         metadata = {**source_data.get("metadata", {}), "score": scores[doc_id]}
         if "embedding" in source_data:
             metadata["embedding"] = source_data["embedding"]
-        docs.append(
-            Document(page_content=source_data["chunk"], metadata=metadata)
-        )
+        docs.append(Document(page_content=source_data["chunk"], metadata=metadata))
 
     return docs
 
@@ -491,9 +495,7 @@ async def retrieve_full_document(
     return {"docs": docs}
 
 
-async def summarize_document(
-    state: State, runtime: Runtime[Context]
-) -> Dict[str, Any]:
+async def summarize_document(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     """Summarize a full document, using two-stage strategy for long documents."""
     full_text = "\n\n".join(doc.page_content for doc in state.docs)
     total_tokens = _estimate_tokens(full_text)
@@ -510,27 +512,33 @@ async def summarize_document(
     else:
         # Two-stage: section summaries then synthesis
         groups = _chunk_documents(state.docs)
-        section_prompt = ChatPromptTemplate.from_messages([
-            ("system", SUMMARIZE_SYSTEM_TEMPLATE),
-            ("human", SUMMARIZE_DOCUMENT_TEMPLATE),
-        ])
+        section_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SUMMARIZE_SYSTEM_TEMPLATE),
+                ("human", SUMMARIZE_DOCUMENT_TEMPLATE),
+            ]
+        )
         section_chain = section_prompt | llm_summarize | StrOutputParser()
 
-        section_summaries = await asyncio.gather(*[
-            section_chain.ainvoke({
-                "document": "\n\n".join(doc.page_content for doc in group)
-            })
-            for group in groups
-        ])
+        section_summaries = await asyncio.gather(
+            *[
+                section_chain.ainvoke(
+                    {"document": "\n\n".join(doc.page_content for doc in group)}
+                )
+                for group in groups
+            ]
+        )
 
-        synthesis_prompt = ChatPromptTemplate.from_messages([
-            ("system", SUMMARIZE_SYSTEM_TEMPLATE),
-            ("human", SUMMARIZE_SECTIONS_TEMPLATE),
-        ])
+        synthesis_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SUMMARIZE_SYSTEM_TEMPLATE),
+                ("human", SUMMARIZE_SECTIONS_TEMPLATE),
+            ]
+        )
         synthesis_chain = synthesis_prompt | llm_summarize | StrOutputParser()
-        summary = await synthesis_chain.ainvoke({
-            "section_summaries": "\n\n---\n\n".join(section_summaries)
-        })
+        summary = await synthesis_chain.ainvoke(
+            {"section_summaries": "\n\n---\n\n".join(section_summaries)}
+        )
 
     return {"messages": [AIMessage(content=summary)]}
 
