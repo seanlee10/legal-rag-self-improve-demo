@@ -233,6 +233,15 @@ def build_knn_query(
     }
 
 
+def build_full_document_query(source_file: str) -> Dict[str, Any]:
+    """Build a query to fetch all chunks for a given source document."""
+    return {
+        "size": 10000,
+        "query": {"term": {"metadata.source": source_file}},
+        "sort": [{"_id": "asc"}],
+    }
+
+
 # --- Async OpenSearch retriever ---
 class OpenSearchRetriever(BaseRetriever):
     """Retrieve documents from OpenSearch using hybrid text + kNN search."""
@@ -401,6 +410,22 @@ async def retrieve(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     docs = await retriever.ainvoke(
         query, search_query=state.search_query, source_file=state.source_file
     )
+    return {"docs": docs}
+
+
+async def retrieve_full_document(
+    state: State, runtime: Runtime[Context]
+) -> Dict[str, Any]:
+    """Retrieve all chunks for a document from OpenSearch by source filename."""
+    body = build_full_document_query(state.source_file)
+    resp = await opensearch_client.search(index=os.environ["INDEX"], body=body)
+    docs = [
+        Document(
+            page_content=hit["_source"]["chunk"],
+            metadata=hit["_source"].get("metadata", {}),
+        )
+        for hit in resp["hits"]["hits"]
+    ]
     return {"docs": docs}
 
 
