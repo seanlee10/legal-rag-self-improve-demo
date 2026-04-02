@@ -95,6 +95,8 @@ async def generate_embedding(input_text: str) -> List[float]:
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             data = await resp.json()
+            if "data" not in data:
+                raise ValueError(f"Embedding API error: {data}")
             return data["data"][0]["embedding"]
 
 
@@ -311,6 +313,7 @@ class State:
     docs: List[Document] = field(default_factory=list)
     search_query: str = ""
     source_file: str = ""
+    intent: str = "qa"
 
 
 def _extract_query(message: Any) -> str:
@@ -322,9 +325,22 @@ def _extract_query(message: Any) -> str:
     return str(message)
 
 
+# --- Intent detection ---
+_SUMMARIZE_KEYWORDS = {"summarize", "summary"}
+
+
+def _detect_intent(text: str) -> str:
+    """Return 'summarize' if text contains a summarization keyword, else 'qa'."""
+    lower = text.lower()
+    for kw in _SUMMARIZE_KEYWORDS:
+        if kw in lower:
+            return "summarize"
+    return "qa"
+
+
 # --- Graph nodes ---
 def parse_input(state: State) -> Dict[str, Any]:
-    """Extract question text and optional filename from a multipart message."""
+    """Extract question text, optional filename, and intent from a message."""
     message = state.messages[-1]
     if hasattr(message, "content"):
         content = message.content
@@ -333,27 +349,41 @@ def parse_input(state: State) -> Dict[str, Any]:
     else:
         content = str(message)
 
-    # Plain text message — no file attached
+    # Plain text message
     if isinstance(content, str):
+        # Check for inline filename pattern: "Summarize <filename>.pdf"
+        words = content.split()
+        source_file = ""
+        text_parts: List[str] = []
+        for word in words:
+            if not source_file and word.lower().endswith(".pdf"):
+                source_file = word
+            else:
+                text_parts.append(word)
+        query = " ".join(text_parts).strip() or content
+        intent = _detect_intent(content)
         return {
-            "messages": [HumanMessage(content=content)],
-            "source_file": "",
+            "messages": [HumanMessage(content=query)],
+            "source_file": source_file,
+            "intent": intent,
         }
 
     # Multipart message — list of {"type": "text", "text": "..."} dicts
     source_file = ""
-    text_parts: List[str] = []
+    text_parts_multi: List[str] = []
     for part in content:
         text = part.get("text", "") if isinstance(part, dict) else str(part)
         if not source_file and text.lower().endswith(".pdf"):
             source_file = text
         else:
-            text_parts.append(text)
+            text_parts_multi.append(text)
 
-    query = " ".join(text_parts).strip()
+    query = " ".join(text_parts_multi).strip()
+    intent = _detect_intent(query)
     return {
         "messages": [HumanMessage(content=query)],
         "source_file": source_file,
+        "intent": intent,
     }
 
 
@@ -374,35 +404,6 @@ async def retrieve(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     return {"docs": docs}
 
 
-async def rerank(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
-    """Rerank retrieved documents using Cohere rerank API."""
-    if not state.docs:
-        return {"docs": []}
-    query = _extract_query(state.messages[-1])
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.cohere.com/v2/rerank",
-            headers={
-                "Authorization": f'Bearer {os.environ["COHERE_API_KEY"]}',
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "rerank-v3.5",
-                "query": query,
-                "documents": [doc.page_content for doc in state.docs],
-                "top_n": len(state.docs),
-            },
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            data = await resp.json()
-    reranked = []
-    for result in data["results"]:
-        doc = state.docs[result["index"]]
-        doc.metadata["rerank_score"] = result["relevance_score"]
-        reranked.append(doc)
-    return {"docs": reranked}
-
-
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     """Generate a response using retrieved context and GPT-4o-mini."""
     query = _extract_query(state.messages[-1])
@@ -420,12 +421,10 @@ graph = (
     .add_node(parse_input)
     .add_node(rewrite_query)
     .add_node(retrieve)
-    .add_node(rerank)
     .add_node(call_model)
     .add_edge("__start__", "parse_input")
     .add_edge("parse_input", "rewrite_query")
     .add_edge("rewrite_query", "retrieve")
-    .add_edge("retrieve", "rerank")
-    .add_edge("rerank", "call_model")
+    .add_edge("retrieve", "call_model")
     .compile(name="New Graph")
 )

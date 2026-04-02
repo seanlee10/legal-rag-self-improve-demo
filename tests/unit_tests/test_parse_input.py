@@ -54,3 +54,39 @@ def test_multipart_no_pdf():
     msg = result["messages"][0]
     assert "compliance requirements" in msg.content
     assert "banking sector" in msg.content
+
+
+def test_summarize_intent_plain_text():
+    """Plain text with 'summarize' keyword and filename sets intent to 'summarize'."""
+    state = _make_state("Summarize report.pdf")
+    result = parse_input(state)
+    assert result["intent"] == "summarize"
+    assert result["source_file"] == "report.pdf"
+
+
+def test_summarize_intent_multipart():
+    """Multipart message with 'summary' keyword sets intent to 'summarize'."""
+    state = _make_state([
+        {"type": "text", "text": "Give me a summary"},
+        {"type": "text", "text": "06MC010425F12568B380B14D9CBFEC5270EA9F5FF3.pdf"},
+    ])
+    result = parse_input(state)
+    assert result["intent"] == "summarize"
+    assert result["source_file"] == "06MC010425F12568B380B14D9CBFEC5270EA9F5FF3.pdf"
+
+
+def test_qa_intent_default():
+    """Plain question without summarize keyword defaults to 'qa'."""
+    state = _make_state("What are the compliance requirements?")
+    result = parse_input(state)
+    assert result["intent"] == "qa"
+
+
+def test_qa_intent_multipart_no_summarize():
+    """Multipart question without summarize keyword defaults to 'qa'."""
+    state = _make_state([
+        {"type": "text", "text": "What are the compliance requirements?"},
+        {"type": "text", "text": "06MC010425F12568B380B14D9CBFEC5270EA9F5FF3.pdf"},
+    ])
+    result = parse_input(state)
+    assert result["intent"] == "qa"
