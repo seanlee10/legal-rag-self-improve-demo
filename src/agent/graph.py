@@ -192,6 +192,45 @@ def _rrf_merge(
     return docs
 
 
+def build_bm25_query(
+    text: str, fetch_size: int, source_file: str = ""
+) -> Dict[str, Any]:
+    """Build a BM25 multi_match query, optionally filtered by source file."""
+    match = {
+        "multi_match": {
+            "query": text,
+            "fields": ["chunk", "metadata.title^2"],
+        }
+    }
+    if source_file:
+        return {
+            "size": fetch_size,
+            "query": {
+                "bool": {
+                    "must": [match],
+                    "filter": [{"term": {"metadata.source": source_file}}],
+                }
+            },
+        }
+    return {"size": fetch_size, "query": match}
+
+
+def build_knn_query(
+    embedding: List[float], fetch_size: int, source_file: str = ""
+) -> Dict[str, Any]:
+    """Build a kNN query, optionally filtered by source file."""
+    knn: Dict[str, Any] = {
+        "vector": embedding,
+        "k": fetch_size,
+    }
+    if source_file:
+        knn["filter"] = {"term": {"metadata.source": source_file}}
+    return {
+        "size": fetch_size,
+        "query": {"knn": {"embedding": knn}},
+    }
+
+
 # --- Async OpenSearch retriever ---
 class OpenSearchRetriever(BaseRetriever):
     """Retrieve documents from OpenSearch using hybrid text + kNN search."""
@@ -206,36 +245,19 @@ class OpenSearchRetriever(BaseRetriever):
         *,
         run_manager: Any = None,
         search_query: str = "",
+        source_file: str = "",
     ) -> List[Document]:
         """Search OpenSearch with separate BM25 and kNN queries fused via RRF."""
         fetch_size = self.k * 3
         bm25_text = search_query or query
         embedding = await generate_embedding(query)
 
-        bm25_query = {
-            "size": fetch_size,
-            "query": {
-                "multi_match": {
-                    "query": bm25_text,
-                    "fields": ["chunk", "metadata.title^2"],
-                }
-            },
-        }
-        knn_query = {
-            "size": fetch_size,
-            "query": {
-                "knn": {
-                    "embedding": {
-                        "vector": embedding,
-                        "k": fetch_size,
-                    }
-                }
-            },
-        }
+        bm25_body = build_bm25_query(bm25_text, fetch_size, source_file)
+        knn_body = build_knn_query(embedding, fetch_size, source_file)
 
         bm25_resp, knn_resp = await asyncio.gather(
-            self.client.search(index=self.index, body=bm25_query),
-            self.client.search(index=self.index, body=knn_query),
+            self.client.search(index=self.index, body=bm25_body),
+            self.client.search(index=self.index, body=knn_body),
         )
 
         docs = _rrf_merge(bm25_resp, knn_resp, k=self.k)
@@ -341,7 +363,9 @@ async def rewrite_query(state: State, runtime: Runtime[Context]) -> Dict[str, An
 async def retrieve(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     """Retrieve relevant documents from OpenSearch."""
     query = _extract_query(state.messages[-1])
-    docs = await retriever.ainvoke(query, search_query=state.search_query)
+    docs = await retriever.ainvoke(
+        query, search_query=state.search_query, source_file=state.source_file
+    )
     return {"docs": docs}
 
 
