@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 import aiohttp
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
@@ -288,6 +288,7 @@ class State:
     messages: List[AnyMessage] = field(default_factory=list)
     docs: List[Document] = field(default_factory=list)
     search_query: str = ""
+    source_file: str = ""
 
 
 def _extract_query(message: Any) -> str:
@@ -300,6 +301,35 @@ def _extract_query(message: Any) -> str:
 
 
 # --- Graph nodes ---
+def parse_input(state: State) -> Dict[str, Any]:
+    """Extract question text and optional filename from a multipart message."""
+    message = state.messages[-1]
+    content = message.content
+
+    # Plain text message — no file attached
+    if isinstance(content, str):
+        return {
+            "messages": [HumanMessage(content=content)],
+            "source_file": "",
+        }
+
+    # Multipart message — list of {"type": "text", "text": "..."} dicts
+    source_file = ""
+    text_parts: List[str] = []
+    for part in content:
+        text = part.get("text", "") if isinstance(part, dict) else str(part)
+        if text.lower().endswith(".pdf"):
+            source_file = text
+        else:
+            text_parts.append(text)
+
+    query = " ".join(text_parts).strip()
+    return {
+        "messages": [HumanMessage(content=query)],
+        "source_file": source_file,
+    }
+
+
 async def rewrite_query(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     """Expand the user question into search-optimized legal terms."""
     query = _extract_query(state.messages[-1])
@@ -358,11 +388,13 @@ async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
 # --- Define the graph ---
 graph = (
     StateGraph(State, context_schema=Context)
+    .add_node(parse_input)
     .add_node(rewrite_query)
     .add_node(retrieve)
     .add_node(rerank)
     .add_node(call_model)
-    .add_edge("__start__", "rewrite_query")
+    .add_edge("__start__", "parse_input")
+    .add_edge("parse_input", "rewrite_query")
     .add_edge("rewrite_query", "retrieve")
     .add_edge("retrieve", "rerank")
     .add_edge("rerank", "call_model")
