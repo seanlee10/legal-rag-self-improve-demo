@@ -21,13 +21,17 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
-from agent.instrumentation import tracer_provider
-from openinference.instrumentation.langchain import LangChainInstrumentor, get_current_span
+from openinference.instrumentation.langchain import (
+    LangChainInstrumentor,
+    get_current_span,
+)
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
-from opentelemetry import trace
 from opensearchpy import AsyncOpenSearch
+from opentelemetry import trace
 from pydantic import Field
 from typing_extensions import TypedDict
+
+from agent.instrumentation import tracer_provider
 
 tracer = tracer_provider.get_tracer(__name__)
 
@@ -542,6 +546,13 @@ async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
     return {"messages": [AIMessage(content=response)]}
 
 
+def route_intent(state: State) -> str:
+    """Route to summarization or QA branch based on detected intent."""
+    if state.intent == "summarize":
+        return "retrieve_full_document"
+    return "rewrite_query"
+
+
 # --- Define the graph ---
 graph = (
     StateGraph(State, context_schema=Context)
@@ -549,9 +560,14 @@ graph = (
     .add_node(rewrite_query)
     .add_node(retrieve)
     .add_node(call_model)
+    .add_node(retrieve_full_document)
+    .add_node(summarize_document)
     .add_edge("__start__", "parse_input")
-    .add_edge("parse_input", "rewrite_query")
+    .add_conditional_edges("parse_input", route_intent)
+    # QA branch
     .add_edge("rewrite_query", "retrieve")
     .add_edge("retrieve", "call_model")
+    # Summarization branch
+    .add_edge("retrieve_full_document", "summarize_document")
     .compile(name="New Graph")
 )
